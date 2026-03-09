@@ -1,5 +1,5 @@
-/figures/*
-/pickles/*
+figures/*
+pickles/*
 *.csv
 __pycache__
 EPN612
