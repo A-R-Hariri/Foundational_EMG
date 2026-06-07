@@ -1,301 +1,424 @@
-import numpy as np, pandas as pd
-import matplotlib.pyplot as plt
-from sklearn.metrics import f1_score, balanced_accuracy_score
-from typing import Any
-
-import torch; import torch.nn as nn
+import os
+import gc
+import re
+import math
+import glob
+import bisect
+import functools
+import warnings
+import numpy as np
+import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim import Adam
 from torch.amp import GradScaler, autocast
-from torch.utils.data import (DataLoader,TensorDataset)
-
-def is_notebook():
-    try:
-        from IPython import get_ipython; shell = get_ipython()
-        if shell is None: return False
-        return shell.__class__.__name__ == "ZMQInteractiveShell"
-    except: return False
-
-if is_notebook():
-    from tqdm.notebook import tqdm
-else:
-    from tqdm import tqdm
-
-from libemg.feature_extractor import FeatureExtractor
-from Losses.VICReg import vicreg_loss, augment
-
+from torch.optim import Adam
+from torch.utils.data import Dataset, DataLoader, random_split
+import torch.distributed as dist
+from tqdm import tqdm
 
 # ======== CONFIG ========
-PATH = "pickles"
-DTYPE = np.float32
-SEQ = 200; SSL_INC = 40; INC = 5; CH = 8; CLASSES = 5
-VAL_CUTOFF = 55; WORKERS = 4; PRE_FETCH = 2; VERBOSE=True
-UPDATE_EVERY = 1; PRESIST_WORKER = True; PIN_MEMORY = True
-DEVICE = 'cuda'
 
-FT_CLASSES = [0, 1, 2, 3, 4]
+DATA_PATH = "data_pickles"
+CKPT_PATH = "checkpoints"
+DTYPE = np.float16
 
-SSL_EPOCHS = 20; SSL_LR = 5e-5; LR_PATIENCE_SSL = 4
-FT_EPOCHS = 100; LR_INIT = 1e-3; LR_MIN = 5e-6
-LR_FACTOR = 0.8; LR_PATIENCE = 4; DROPOUT = 0.2 
-SSL_BATCH_SIZE = 4096; BATCH_SIZE = 128; PATIENCE = 10
+# -------- training --------
+BATCH_SIZE = 128
+EPOCHS = 200
+LR = 1e-4
+MIN_LR = 1e-6
+LR_FACTOR = 0.8
+LR_PATIENCE = 2
+PATIENCE = 10
+SEED = 67
+
+# -------- FSDP model --------
+LATENT_DIM = 256
+NUM_HEADS = 4
+NUM_LAYERS = 4
+DROPOUT = 0.1
+CONV_KERNEL = 8
+CONV_STRIDE = 4
+CONV_PADDING = CONV_KERNEL // 2
+
+# -------- SSL objectives --------
+MAE_MASK_FRAC = 0.3
+MAE_LOSS_W = 1.0
+VIC_LOSS_W = 1.0
+
+# -------- DDP fixed-shape --------
+DDP_BATCH_SIZE = 2048
+TARGET_WIN_SEC = 0.2
+TARGET_FS = 500
+SEQ = int(TARGET_WIN_SEC * TARGET_FS)
+
+# -------- augmentation probs (variable-length) --------
+AUG_PROBS = {
+    "amp_global": 0.7,
+    "amp_per_ch": 0.5,
+    "baseline": 0.3,
+    "tshift": 0.7,
+    "time_warp": 0.5,
+    "noise": 0.6,
+    "ch_dropout": 0.2,
+    "ch_perm": 0.5,
+    "mag_warp": 0.5,
+    "lowpass": 0.3,
+}
+
+# ======== MISC ========
+
+def count_params(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def sync_mean(val, device):
+    t = torch.tensor([float(val)], device=device, dtype=torch.float32)
+    if dist.is_initialized():
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        t = t / dist.get_world_size()
+    return float(t.item())
+
+def _worker_init_fn(worker_id):
+    np.random.seed(SEED + worker_id + 1)
+    torch.manual_seed(SEED + worker_id + 1)
+
+# ======== LOSSES ========
+
+def vicreg_loss(z1, z2, lamb=25.0, mu=25.0, nu=1.0, gamma=1.0):
+    sim = ((z1 - z2) ** 2).mean()
+
+    def var_term(z):
+        return F.relu(gamma - z.std(dim=0, unbiased=False)).mean()
+
+    def cov_term(z):
+        zc = z - z.mean(dim=0)
+        cov = (zc.T @ zc) / (zc.size(0) - 1 + 1e-6)
+        off = cov - torch.diag(torch.diag(cov))
+        return (off ** 2).mean()
+
+    return lamb * sim + mu * (var_term(z1) + var_term(z2)) + nu * (cov_term(z1) + cov_term(z2))
+
+def generate_mae_mask(time_mask, frac=MAE_MASK_FRAC):
+    B, L = time_mask.shape
+    mask = torch.zeros_like(time_mask)
+    for b in range(B):
+        valid = torch.where(time_mask[b])[0]
+        k = int(max(1, frac * valid.numel()))
+        if k > 0:
+            sel = valid[torch.randperm(valid.numel(), device=time_mask.device)[:k]]
+            mask[b, sel] = True
+    return mask
+
+# ======== AUGMENTATION ========
+
+def _lowpass_avg(x, k=5):
+    if k <= 1:
+        return x
+    csum = torch.cumsum(x, dim=1)
+    ma = csum.clone()
+    ma[:, k:, :] = csum[:, k:, :] - csum[:, :-k, :]
+    ma = ma / k
+    head_counts = torch.arange(1, k, device=x.device, dtype=x.dtype).view(1, -1, 1)
+    ma[:, :k-1, :] = csum[:, :k-1, :] / head_counts
+    return ma
+
+def _magnitude_warp(x, prob=0.5, knots=4, amp=0.2):
+    B, L, C = x.shape
+    if torch.rand(()) >= prob or knots <= 1:
+        return x
+    scales = 1.0 + amp * (2 * torch.rand(B, knots, device=x.device) - 1.0)
+    warp = F.interpolate(scales.unsqueeze(1), size=L, mode='linear', align_corners=True)
+    return x * warp.squeeze(1).unsqueeze(-1)
+
+def _time_warp(x, prob=0.5, factor_range=(0.95, 1.05)):
+    B, L, C = x.shape
+    if torch.rand(()) >= prob:
+        return x
+    factors = torch.empty(B, device=x.device).uniform_(*factor_range)
+    warped = torch.empty(B, L, C, device=x.device, dtype=x.dtype)
+    for b in range(B):
+        new_L = max(1, min(int((factors[b] * L).item()), L))
+        ib = F.interpolate(x[b].T.unsqueeze(0), size=new_L, mode='linear', align_corners=True).squeeze(0).T
+        if new_L < L:
+            ib = F.pad(ib, (0, 0, 0, L - new_L))
+        warped[b] = ib
+    return warped
+
+def emg_augment(x, time_mask, ch_mask, probs=AUG_PROBS):
+    """GPU-batched augmentation for variable-length padded EMG. x: (B, L, C)."""
+    B, L, C = x.shape
+    device = x.device
+    y = x.clone()
+    if torch.rand(()) < probs["amp_global"]:
+        y = y * torch.empty(B, 1, 1, device=device).uniform_(0.8, 1.2)
+    if torch.rand(()) < probs["amp_per_ch"]:
+        y = y * torch.empty(B, 1, C, device=device).uniform_(0.8, 1.2)
+    if torch.rand(()) < probs["baseline"]:
+        tlin = torch.linspace(0, 1, L, device=device, dtype=y.dtype).view(1, L, 1)
+        if torch.rand(()) < 0.5:
+            phase = 2 * math.pi * torch.rand(B, 1, 1, device=device, dtype=y.dtype)
+            drift = 0.05 * torch.sin(phase + 2 * math.pi * 0.5 * tlin)
+        else:
+            slope = 0.05 * (2 * torch.rand(B, 1, 1, device=device, dtype=y.dtype) - 1)
+            drift = slope * tlin
+        y = y + drift
+    if torch.rand(()) < probs["tshift"]:
+        shift = int(torch.randint(-8, 9, ()).item())
+        if shift != 0:
+            for b in range(B):
+                l = int(time_mask[b].sum().item())
+                if l > 0:
+                    y[b, :l] = torch.roll(y[b, :l], shifts=shift, dims=0)
+    y = _time_warp(y, prob=probs["time_warp"])
+    y = _magnitude_warp(y, prob=probs["mag_warp"])
+    if torch.rand(()) < probs["noise"]:
+        std = y.std(dim=(1, 2), keepdim=True).clamp_min(1e-6)
+        y = y + 0.02 * std * torch.randn_like(y)
+    if torch.rand(()) < probs["ch_dropout"]:
+        k = max(1, int(C * 0.1))
+        for b in range(B):
+            valid = torch.where(ch_mask[b])[0]
+            if valid.numel() > 0:
+                y[b, :, valid[torch.randperm(valid.numel(), device=device)[:k]]] = 0
+    if torch.rand(()) < probs["ch_perm"]:
+        for b in range(B):
+            valid = torch.where(ch_mask[b])[0]
+            if valid.numel() > 1:
+                perm = valid[torch.randperm(valid.numel(), device=device)]
+                y_b = y[b].clone()
+                y[b, :, valid] = y_b[:, perm]
+    if torch.rand(()) < probs["lowpass"]:
+        k = int(torch.randint(0, 3, (1,), device=device).item() * 2 + 3)
+        y = _lowpass_avg(y, k=k)
+    return y
+
+def augment_gpu(x):
+    """Simple batch augmentation for fixed-shape windows. x: (B, L, C)."""
+    y = x.clone()
+    device = x.device
+    if torch.rand((), device=device) < 0.5:
+        y = y * (1.0 + 0.1 * torch.randn((), device=device, dtype=x.dtype))
+    if torch.rand((), device=device) < 0.5:
+        y = torch.roll(y, shifts=int(torch.randint(-4, 5, (), device=device)), dims=1)
+    if torch.rand((), device=device) < 0.5:
+        std = y.std().clamp_min(1e-6)
+        y = y + 0.02 * std * torch.randn_like(y)
+    if torch.rand((), device=device) < 0.1:
+        k = max(1, int(torch.randint(1, min(2, y.shape[2]), (), device=device)))
+        y[:, :, torch.randperm(y.shape[2], device=device)[:k]] = 0
+    return y
+
+# ======== DATASETS ========
+
+_ws_pat = re.compile(r"_ws(\d+)_?(\d+)?_")
+
+def _parse_ws(fname):
+    m = _ws_pat.search(fname)
+    if not m:
+        return None
+    a, b = m.group(1), m.group(2)
+    return float(a) if b is None else float(f"{a}.{b}")
+
+def _infer_fs(n_samples, ws):
+    if ws is None or ws <= 0:
+        return None
+    return float(n_samples) / float(ws)
+
+class NPYWindows(Dataset):
+    """Memory-mapped dataset over chunked .npy window files from process_cross_dataset.py.
+
+    Each file has shape (N, L, C) in float16. Files from different datasets and window
+    sizes are interleaved; channels and lengths may vary across files.
+    """
+
+    def __init__(self, root, subset_ratio=1.0, ws_filter=None):
+        files = sorted(glob.glob(os.path.join(root, "*.npy")))
+        if not files:
+            raise FileNotFoundError(f"No .npy files in {root}")
+        if ws_filter is not None:
+            files = [f for f in files if abs(_parse_ws(os.path.basename(f)) - ws_filter) < 1e-4
+                     if _parse_ws(os.path.basename(f)) is not None]
+        self.files, self.maps, self.LC, self.ws_list, self.fs_list, self.lengths = [], [], [], [], [], []
+        all_Cs = []
+        for f in tqdm(files, desc="Scanning files", leave=False):
+            ws = _parse_ws(os.path.basename(f))
+            try:
+                arr = np.load(f, mmap_mode="r")
+            except Exception as e:
+                print(f"Warning: skipping {f}: {e}")
+                continue
+            if arr.ndim != 3 or arr.shape[0] == 0:
+                continue
+            N, L, C = arr.shape
+            all_Cs.append(C)
+            keep = int(N * subset_ratio)
+            if keep <= 0:
+                continue
+            self.files.append(f)
+            self.maps.append(arr)
+            self.LC.append((L, C))
+            self.ws_list.append(ws)
+            self.fs_list.append(_infer_fs(L, ws))
+            self.lengths.append(keep)
+        if not self.files:
+            raise RuntimeError("No usable files found.")
+        self.cum = np.cumsum([0] + self.lengths)
+        self.global_max_C = int(max(all_Cs))
+
+    def __len__(self):
+        return int(self.cum[-1])
+
+    def _locate(self, idx):
+        i = bisect.bisect_right(self.cum, idx) - 1
+        return i, idx - self.cum[i]
+
+    def __getitem__(self, idx):
+        fi, row = self._locate(idx)
+        x = torch.from_numpy(self.maps[fi][row].astype(np.float16, copy=False))
+        fs = self.fs_list[fi] if self.fs_list[fi] is not None else 1.0
+        return {"x": x, "fs": float(fs)}
 
 
-# ======== UTILS ========
-def count_params(m):
-    return sum(p.numel() for p in m.parameters() if p.requires_grad)
-
-def remap_labels(y: np.ndarray, keep_classes: list[int]) -> np.ndarray:
-    lut = {c: i for i, c in enumerate(keep_classes)}
-    return np.vectorize(lut.get)(y).astype(np.int64)
-
-def filter_by_classes(x: np.ndarray, y: np.ndarray, 
-                      keep_classes: list[int]):
-    keep = np.isin(y, np.array(keep_classes, dtype=y.dtype))
-    return x[keep], y[keep]
-
-def _check(name, t):
-    if not torch.is_tensor(t): return
-    if torch.isnan(t).any() or torch.isinf(t).any():
-        raise RuntimeError(f"NaN/Inf in {name}: "
-                           f"nan={torch.isnan(t).any().item()} "
-                           f"inf={torch.isinf(t).any().item()} "
-                           f"min={t.nan_to_num().min().item()} "
-                           f"max={t.nan_to_num().max().item()}")
+def collate_variable(batch, global_max_C):
+    """Collate variable-length, variable-channel samples into padded tensors."""
+    max_L = max(item["x"].shape[0] for item in batch)
+    B = len(batch)
+    xs = torch.zeros(B, max_L, global_max_C, dtype=torch.float16)
+    time_masks = torch.zeros(B, max_L, dtype=torch.bool)
+    ch_masks = torch.zeros(B, global_max_C, dtype=torch.bool)
+    fs_list = torch.zeros(B, dtype=torch.float32)
+    for b, item in enumerate(batch):
+        x = item["x"]
+        L, C = x.shape
+        xs[b, :L, :C] = x
+        time_masks[b, :L] = True
+        ch_masks[b, :C] = True
+        fs_list[b] = item["fs"]
+    return xs, time_masks, ch_masks, fs_list
 
 
-# ======== UTILS ========
-def extract_features(x, feature_list, feature_dic=None):
-    feature_extractor = FeatureExtractor()
-    features = feature_extractor.extract_features(feature_list, x, array=True,
-                                fix_feature_errors=False, feature_dic=feature_dic)
-    return torch.from_numpy(features.astype(DTYPE))
+class FixedWindowNPY(Dataset):
+    """Fixed-shape dataset loading files for a single window size."""
 
+    def __init__(self, root, ws_filter, split_frac=0.9, split="train", seed=SEED):
+        files = sorted(glob.glob(os.path.join(root, "*.npy")))
+        files = [
+            f for f in files
+            if (ws := _parse_ws(os.path.basename(f))) is not None
+            and abs(ws - ws_filter) < 1e-4
+        ]
+        if not files:
+            raise FileNotFoundError(f"No files matching ws={ws_filter} in {root}")
+        self.maps = [np.load(f, mmap_mode="r") for f in files]
+        all_idx = [(fi, i) for fi, m in enumerate(self.maps) for i in range(m.shape[0])]
+        rng = np.random.default_rng(seed)
+        rng.shuffle(all_idx)
+        cut = int(len(all_idx) * split_frac)
+        self.index = all_idx[:cut] if split == "train" else all_idx[cut:]
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, idx):
+        fi, i = self.index[idx]
+        return torch.from_numpy(self.maps[fi][i].astype(np.float32, copy=False))
 
 # ======== LOADERS ========
-def create_sup_loader(x, y, batch=BATCH_SIZE, shuffle=False, 
-                  workers=WORKERS, prefetch_factor=PRE_FETCH,
-                  persistent_workers=PRESIST_WORKER):
-    return DataLoader(
-    TensorDataset(torch.from_numpy(x), 
-                  torch.from_numpy(y)),
-                #   torch.tensor(x), 
-                #   torch.tensor(y)),
-    batch_size=batch,
-    shuffle=shuffle,
-    num_workers=workers,
-    prefetch_factor=prefetch_factor if workers > 0 else None,
-    persistent_workers=persistent_workers,
-    pin_memory=PIN_MEMORY,
-    drop_last=False)
+
+def create_fsdp_loaders(data_path, batch_size, world_size, rank, subset_ratio=1.0):
+    """Loaders for variable-length FSDP pretraining."""
+    ds = NPYWindows(data_path, subset_ratio=subset_ratio)
+    gen = torch.Generator().manual_seed(SEED)
+    train_len = int(0.9 * len(ds))
+    val_len = len(ds) - train_len
+    train_ds, val_ds = random_split(ds, [train_len, val_len], generator=gen)
+    collate_fn = functools.partial(collate_variable, global_max_C=ds.global_max_C)
+
+    def sampler(d, shuffle):
+        if world_size <= 1:
+            return None
+        return torch.utils.data.distributed.DistributedSampler(
+            d, num_replicas=world_size, rank=rank, shuffle=shuffle, seed=SEED
+        )
+
+    tr_s, va_s = sampler(train_ds, True), sampler(val_ds, False)
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size,
+        shuffle=(tr_s is None), sampler=tr_s,
+        num_workers=8, prefetch_factor=2,
+        pin_memory=True, drop_last=True,
+        persistent_workers=True, worker_init_fn=_worker_init_fn,
+        collate_fn=collate_fn,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size,
+        shuffle=False, sampler=va_s,
+        num_workers=4, prefetch_factor=2,
+        pin_memory=True, drop_last=False,
+        persistent_workers=True, worker_init_fn=_worker_init_fn,
+        collate_fn=collate_fn,
+    )
+    return train_loader, val_loader, tr_s, ds.global_max_C
 
 
-def create_ssl_loader(x, batch=BATCH_SIZE, shuffle=False, 
-                  workers=WORKERS, prefetch_factor=PRE_FETCH,
-                  persistent_workers=PRESIST_WORKER):
-    return DataLoader(
-    TensorDataset(torch.from_numpy(x)),
-                #   torch.tensor(x)), 
-    batch_size=batch,
-    shuffle=shuffle,
-    num_workers=workers,
-    prefetch_factor=prefetch_factor if workers > 0 else None,
-    persistent_workers=persistent_workers,
-    pin_memory=PIN_MEMORY,
-    drop_last=False)
+def create_ddp_loaders(data_path, batch_size, ws_filter, world_size=1, rank=0):
+    """Loaders for fixed-shape DDP pretraining."""
+    train_ds = FixedWindowNPY(data_path, ws_filter=ws_filter, split="train")
+    val_ds = FixedWindowNPY(data_path, ws_filter=ws_filter, split="val")
+
+    def sampler(d, shuffle):
+        if world_size <= 1:
+            return None
+        return torch.utils.data.distributed.DistributedSampler(
+            d, num_replicas=world_size, rank=rank, shuffle=shuffle
+        )
+
+    tr_s, va_s = sampler(train_ds, True), sampler(val_ds, False)
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size,
+        shuffle=(tr_s is None), sampler=tr_s,
+        num_workers=8, prefetch_factor=4, pin_memory=True, drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size,
+        shuffle=False, sampler=va_s,
+        num_workers=4, prefetch_factor=4, pin_memory=True, drop_last=False,
+    )
+    return train_loader, val_loader, tr_s, va_s
+
+# ======== CHECKPOINTING ========
+
+def save_checkpoint(model, path, epoch=None, optimizer=None,
+                    scheduler=None, scaler=None, best_val=None, extra=None):
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    state = {
+        "model": model.module.state_dict() if isinstance(model, DDP) else model.state_dict(),
+        "epoch": epoch,
+        "best_val": best_val,
+    }
+    if optimizer is not None:
+        state["optimizer"] = optimizer.state_dict()
+    if scheduler is not None:
+        state["scheduler"] = scheduler.state_dict()
+    if scaler is not None:
+        state["scaler"] = scaler.state_dict()
+    if extra is not None:
+        state.update(extra)
+    torch.save(state, path)
 
 
-# ======== TRAIN (VICREG SSL) ========
-def pretrain_vicreg(
-    model: nn.Module,
-    ssl_loader: DataLoader,
-    name: str,
-    feature_list: list=None,
-    feature_dict: dict=None,
-    epochs: int = SSL_EPOCHS,
-    lr: float = SSL_LR,
-    min_lr: float = LR_MIN,
-    lr_factor: float = LR_FACTOR,
-    lr_patience: int = LR_PATIENCE_SSL,
-    verbose=VERBOSE,
-    device: str = DEVICE):
-
-    model.to(device)
-    opt = Adam(model.parameters(), lr=lr)
-    sch = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, mode="min", factor=lr_factor, patience=lr_patience, min_lr=min_lr)
-    scaler = GradScaler(enabled=(device == "cuda"))
-
-    for ep in range(1, epochs + 1):
-        model.train()
-        total_loss = torch.tensor(0.0, device=device)
-        total = 0
-        step = 0
-        pbar = tqdm(total=len(ssl_loader), desc=f"{name} | SSL Ep {ep}", 
-                    leave=True, dynamic_ncols=True, disable=not verbose)
-
-        for (xb,) in ssl_loader:
-            xb = xb.to(device, non_blocking=True)
-            x1 = augment(xb)
-            x2 = augment(xb)
-
-            if feature_list is not None:
-                x1 = extract_features(x1.detach().cpu(), feature_list, feature_dict)
-                x2 = extract_features(x2.detach().cpu(), feature_list, feature_dict)
-                x1 = x1.to(device, non_blocking=True)
-                x2 = x2.to(device, non_blocking=True)
-
-            opt.zero_grad(set_to_none=True)
-            with autocast(device_type="cuda", 
-                          enabled=(device == "cuda")):
-                z1 = model(x1, return_proj=True)
-                z2 = model(x2, return_proj=True)
-                loss = vicreg_loss(z1, z2)
-
-            scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
-
-            total += xb.numel()
-            step += 1
-            total_loss += loss.detach()
-
-            if not(step % UPDATE_EVERY):
-                pbar.update(UPDATE_EVERY)
-                pbar.set_postfix(loss=f"{total_loss.item() / step:10.8f}", 
-                                 LR=f"{opt.param_groups[0]['lr']:8.6f}")
-
-        if step % UPDATE_EVERY:
-            pbar.update(step % UPDATE_EVERY)
-
-        epoch_loss = total_loss.item() / max(1, len(ssl_loader))
-        sch.step(epoch_loss)
-        pbar.close()
-
-    return model
-
-
-# ======== TRAIN (SUP FINETUNE) ========
-def train_supervised(
-    model: nn.Module,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    name: str,
-    loss_fn: Any,
-    epochs: int = FT_EPOCHS,
-    lr: float = LR_INIT,
-    min_lr: float = LR_MIN,
-    lr_factor: float = LR_FACTOR,
-    lr_patience: int = LR_PATIENCE,
-    patience: int = PATIENCE,
-    verbose=VERBOSE,
-    device: str = DEVICE):
-
-    model.to(device)
-    opt = Adam([p for p in model.parameters() if p.requires_grad], lr=lr)
-    sch = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, mode="min", factor=lr_factor, patience=lr_patience, min_lr=min_lr)
-    scaler = GradScaler(enabled=(device == "cuda"))
-
-    best_val = 1e9
-    best_state = {k: v.clone().cpu() for k, v in 
-                  model.state_dict().items()}
-    wait = 0
-
-    for ep in range(1, epochs + 1):
-        model.train()
-        total_loss = torch.tensor(0.0, device=device)
-        correct = torch.tensor(0.0, device=device)
-        total = 0
-        step = 0
-        pbar = tqdm(total=len(train_loader), desc=f"{name} | FT Ep {ep}", 
-                    leave=True, dynamic_ncols=True, disable=not verbose)
-
-        for xb, yb in train_loader:
-            xb = xb.to(device, non_blocking=True)
-            yb = yb.to(device, non_blocking=True)
-
-            opt.zero_grad(set_to_none=True)
-            with autocast(device_type="cuda", enabled=(device == "cuda")):
-                logits = model(xb)
-                loss = loss_fn(logits, yb)
-
-            scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
-
-            total_loss += loss.detach()
-            correct += (logits.argmax(1) == yb).sum()
-            total += yb.numel()
-            step += 1
-
-            if not(step % UPDATE_EVERY):
-                pbar.update(UPDATE_EVERY)
-                pbar.set_postfix(
-                    loss=f"{total_loss.item() / step:10.8f}",
-                    acc=f"{correct.item() / max(1, total):6.4f}",
-                    LR=f"{opt.param_groups[0]['lr']:8.6f}")
-
-        if step % UPDATE_EVERY:
-            pbar.update(step % UPDATE_EVERY)
-
-        val_acc, val_loss, _, _ = evaluate_sup(model, val_loader, loss_fn, device)
-        sch.step(val_loss)
-
-        if val_loss < best_val:
-            best_val = val_loss
-            best_state = {k: v.clone().cpu() for k, v in 
-                          model.state_dict().items()}
-            wait = 0
-        else:
-            wait += 1
-            if wait >= patience:
-                tqdm.write(f"{name} | Early stop")
-                pbar.close()
-                break
-
-        pbar.set_postfix(
-            loss=f"{total_loss.item() / max(1, len(train_loader)):10.6f}",
-            acc=f"{correct.item() / max(1, total):6.4f}",
-            val_loss=f"{val_loss:10.6f}",
-            val_acc=f"{val_acc:6.4f}",
-            LR=f"{opt.param_groups[0]['lr']:8.6f}",
-            wait=f"{wait:3.0f}")
-        pbar.close()
-
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    return model
-
-
-# ======== EVAL (SUPERVISED) ========
-@torch.no_grad()
-def evaluate_sup(model, loader, loss_fn, device):
-    model.eval()
-    model.to(device)
-    lsum = torch.tensor(0.0, device=device)
-    cor = torch.tensor(0.0, device=device)
-    tot = 0
-    y_true_list, y_pred_list = [], []
-
-    for xb, yb in loader:
-        xb = xb.to(device, non_blocking=True)
-        yb = yb.to(device, non_blocking=True)
-        with torch.amp.autocast(device_type="cuda", 
-                                enabled=(device == "cuda")):
-            logits = model(xb)
-            loss = loss_fn(logits, yb)
-        preds = logits.argmax(1)
-        lsum += loss
-        cor += (preds == yb).sum()
-        tot += yb.numel()
-        y_true_list.append(yb)
-        y_pred_list.append(preds)
-
-    y_true = torch.cat(y_true_list).cpu().numpy()
-    y_pred = torch.cat(y_pred_list).cpu().numpy()
-    f1 = f1_score(y_true, y_pred, average="macro")
-    bal_acc = balanced_accuracy_score(y_true, y_pred)
-    avg_acc = cor.item() / max(1, tot)
-    avg_loss = lsum.item() / max(1, len(loader))
-    return avg_acc, avg_loss, f1, bal_acc
+def load_checkpoint(model, path, rank=0, optimizer=None, scheduler=None,
+                    scaler=None, map_location="cpu"):
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    ckpt = torch.load(path, map_location=map_location)
+    m = model.module if isinstance(model, DDP) else model
+    m.load_state_dict(ckpt["model"])
+    if optimizer is not None and "optimizer" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer"])
+    if scheduler is not None and "scheduler" in ckpt:
+        scheduler.load_state_dict(ckpt["scheduler"])
+    if scaler is not None and "scaler" in ckpt:
+        scaler.load_state_dict(ckpt["scaler"])
+    if rank == 0:
+        print(f"Loaded {path} | epoch={ckpt.get('epoch')} best_val={ckpt.get('best_val'):.4f}")
+    return ckpt.get("epoch", 0), ckpt.get("best_val", float("inf"))
