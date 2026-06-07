@@ -2,7 +2,7 @@
 
 Self-supervised EMG pretraining across multiple datasets and device types, with cross-device generalization as the primary objective. The pretrained encoder can be fine-tuned for downstream tasks such as gesture classification with no or minimal labeled data.
 
-This is the scale-up extension of the zero-shot cross-user EPN612 work, targeting foundational representations rather than single-dataset generalization.
+This is the scale-up extension of the zero-shot cross-user EPN612 work, targeting foundational representations rather than single-dataset generalization, ([`EPN612_Cross_User`](https://github.com/A-R-Hariri/EPN612_Cross_User)).
 
 ---
 
